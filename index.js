@@ -1,3 +1,4 @@
+// index.js
 import "dotenv/config";
 import {
   Client,
@@ -7,13 +8,30 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 
+/**
+ * UNITY RAID OVERSIGHT BOT
+ * - Finds the newest Raid-Helper event link in each team signup channel
+ * - Fetches event JSON from https://raid-helper.dev/api/v2/events/<eventId>
+ * - Counts Tanks / Healers / Melee / Ranged (and optional melee-vs-ranged healer split)
+ * - Computes NEED vs perfect comp (2 tanks, 4 healers, rest DPS based on raidSize)
+ * - Edits ONE dashboard message (so it never gets buried)
+ *
+ * Required Railway Variables:
+ * BOT_TOKEN
+ * GUILD_ID
+ * DASHBOARD_CHANNEL_ID
+ * DASHBOARD_MESSAGE_ID
+ */
+
 const CONFIG = {
   guildId: process.env.GUILD_ID,
   dashboardChannelId: process.env.DASHBOARD_CHANNEL_ID,
   dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID,
 
-  lookbackMessages: 50, // how many messages to scan in each signup channel
+  // how many recent messages to scan in each signup channel to find the newest raid-helper link
+  lookbackMessages: 75,
 
+  // Teams + signup channels (Discord channel IDs)
   teams: [
     { name: "SOLOMONO", signupChannelId: "1071192840408940626", raidSize: 20 },
     { name: "CRIT HAPPENS", signupChannelId: "1248666830810251354", raidSize: 20 },
@@ -21,9 +39,12 @@ const CONFIG = {
     { name: "WEEKEND WARRIORS", signupChannelId: "1338703521138081902", raidSize: 20 },
   ],
 
+  // Perfect comp
   targets: { tanks: 2, healers: 4 },
-  // Optional: if you want to split healers by spec later
-  meleeHealerSpecs: new Set(["Mistweaver", "Holy1", "Holy"]),
+
+  // Optional: split healers into "melee" vs "ranged" by spec
+  // Holy Paladin sometimes shows as "Holy1" in Raid-Helper JSON.
+  meleeHealerSpecs: new Set(["Mistweaver", "Holy", "Holy1"]),
 };
 
 const client = new Client({
@@ -31,11 +52,11 @@ const client = new Client({
 });
 
 function extractEventIdFromMessage(msg) {
-  // 1) Direct link in message content
+  // 1) Link in plain message content
   const m1 = msg.content?.match(/raid-helper\.dev\/event\/(\d+)/i);
   if (m1) return m1[1];
 
-  // 2) Link inside embeds
+  // 2) Link inside embeds (common)
   for (const emb of msg.embeds ?? []) {
     const url = emb.url || "";
     const m2 = url.match(/raid-helper\.dev\/event\/(\d+)/i);
@@ -61,7 +82,9 @@ async function fetchRaidHelperEvent(eventId) {
   const res = await fetch(url);
 
   if (!res.ok) {
-    throw new Error(`Raid-Helper fetch failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `Raid-Helper fetch failed: ${res.status} ${await res.text()}`
+    );
   }
   return await res.json();
 }
@@ -77,7 +100,14 @@ function countRoles(eventJson) {
     return !ignoreClass.has(cn) && st === "primary";
   });
 
-  const counts = { tanks: 0, healers: 0, melee: 0, ranged: 0, mh: 0, rh: 0 };
+  const counts = {
+    tanks: 0,
+    healers: 0,
+    melee: 0,
+    ranged: 0,
+    mh: 0, // melee healers
+    rh: 0, // ranged healers
+  };
 
   for (const s of primaries) {
     const role = String(s.roleName || "");
@@ -120,7 +150,7 @@ function renderDashboard(teamSummaries) {
       minute: "2-digit",
     });
 
-    const raidSize = s.raidSize;
+    const raidSize = s.raidSize ?? 20;
     const tanksTarget = CONFIG.targets.tanks;
     const healsTarget = CONFIG.targets.healers;
     const dpsTarget = Math.max(0, raidSize - (tanksTarget + healsTarget));
@@ -130,4 +160,95 @@ function renderDashboard(teamSummaries) {
     lines.push(needLine("Tank", s.counts.tanks, tanksTarget));
     lines.push(
       needLine("Heals", s.counts.healers, healsTarget) +
-        `  [Melee ${s.counts.mh} | R
+        `  [Melee ${s.counts.mh} | Ranged ${s.counts.rh}]`
+    );
+    lines.push(
+      needLine("DPS", dpsHave, dpsTarget) +
+        `  [Melee ${s.counts.melee} | Ranged ${s.counts.ranged}]`
+    );
+    lines.push("");
+  }
+
+  return "```ansi\n" + lines.join("\n") + "\n```";
+}
+
+async function updateDashboard() {
+  const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
+  if (!dashboardChannel || !dashboardChannel.isTextBased()) {
+    throw new Error("Dashboard channel not found or not text-based.");
+  }
+
+  const teamSummaries = [];
+
+  for (const team of CONFIG.teams) {
+    const signupChannel = await client.channels.fetch(team.signupChannelId);
+    if (!signupChannel || !signupChannel.isTextBased()) {
+      console.log(`[${team.name}] Signup channel not found or not text-based.`);
+      continue;
+    }
+
+    const eventId = await findLatestRaidHelperEventId(signupChannel);
+    if (!eventId) {
+      console.log(
+        `[${team.name}] No raid-helper event link found in last ${CONFIG.lookbackMessages} messages.`
+      );
+      continue;
+    }
+
+    const eventJson = await fetchRaidHelperEvent(eventId);
+    const counts = countRoles(eventJson);
+
+    teamSummaries.push({
+      teamName: team.name,
+      startTime: eventJson.startTime,
+      counts,
+      raidSize: team.raidSize ?? 20,
+    });
+
+    console.log(`[${team.name}] Event ${eventId} counted:`, counts);
+  }
+
+  teamSummaries.sort((a, b) => a.startTime - b.startTime);
+
+  const content = renderDashboard(teamSummaries);
+
+  const msg = await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId);
+  await msg.edit(content);
+
+  console.log("Dashboard updated.");
+}
+
+async function registerCommands() {
+  const cmd = new SlashCommandBuilder()
+    .setName("refreshdashboard")
+    .setDescription("Refresh the raid oversight dashboard");
+
+  const rest = new REST({ version: "10" }).setToken(process.env.BOT_TOKEN);
+  await rest.put(
+    Routes.applicationGuildCommands(client.user.id, CONFIG.guildId),
+    { body: [cmd.toJSON()] }
+  );
+
+  console.log("Slash command registered: /refreshdashboard");
+}
+
+client.on("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  await registerCommands();
+
+  // Update on boot + every 2 hours
+  await updateDashboard();
+  setInterval(updateDashboard, 2 * 60 * 60 * 1000);
+});
+
+client.on("interactionCreate", async (i) => {
+  if (!i.isChatInputCommand()) return;
+  if (i.commandName === "refreshdashboard") {
+    await i.deferReply({ ephemeral: true });
+    await updateDashboard();
+    await i.editReply("Dashboard refreshed ✅");
+  }
+});
+
+client.login(process.env.BOT_TOKEN);
