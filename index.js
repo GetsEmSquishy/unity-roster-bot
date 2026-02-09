@@ -9,10 +9,6 @@ import {
 } from "discord.js";
 
 /**
- * UNITY RAID OVERSIGHT BOT
- * - Updates Oversight Dashboard message
- * - Updates RAID RECRUITMENT thread message (emoji formatted)
- *
  * Required Railway Variables:
  * BOT_TOKEN
  * GUILD_ID
@@ -33,57 +29,24 @@ const CONFIG = {
   recruitmentThreadId: process.env.RECRUITMENT_THREAD_ID,
   recruitmentMessageId: process.env.RECRUITMENT_MESSAGE_ID || "",
 
-  // Total messages to scan in each signup channel
-  LOOKBACK_TOTAL: 50, // your channels are locked down, so this can stay small
+  LOOKBACK_TOTAL: 50,
 
-  // Perfect comp
   targets: { tanks: 2, healers: 4 },
 
-  // Optional healer split by spec
   meleeHealerSpecs: new Set(["Mistweaver", "Holy", "Holy1"]),
 
-  // Teams (signup channels + raidSize)
   teams: [
     { key: "WEEKEND", name: "WEEKEND WARRIORS", signupChannelId: "1338703521138081902", raidSize: 20 },
     { key: "SOLO", name: "SOLONOMO", signupChannelId: "1071192840408940626", raidSize: 20 },
     { key: "EARLY", name: "EARLY BIRD", signupChannelId: "1216844831767396544", raidSize: 20 },
     { key: "CRIT", name: "CRIT HAPPENS", signupChannelId: "1248666830810251354", raidSize: 20 },
-    // If you add Debuff The Drama later, drop it here:
-    // { key: "DEBUFF", name: "Debuff The Drama", signupChannelId: "XXXXXXXXXXXX", raidSize: 20 },
   ],
 
-  // Static “recruitment card” info (what you showed in your example)
   recruitmentCards: {
-    WEEKEND: {
-      headerEmoji: ":shield:",
-      time: "Thursday & Sunday Evenings",
-      leader: "@snick_",
-      notes: "",
-    },
-    SOLO: {
-      headerEmoji: ":crossed_swords:",
-      time: "Friday Evening",
-      leader: "@vikinghammers",
-      notes: "",
-    },
-    EARLY: {
-      headerEmoji: ":sunrise:",
-      time: "Tuesday & Thursday",
-      leader: "@johnnynobeard",
-      notes: "",
-    },
-    CRIT: {
-      headerEmoji: ":fire:",
-      time: "Friday & Sunday (Late Evening)",
-      leader: "@frostynips",
-      notes: "Melee DPS: Monk please",
-    },
-    DEBUFF: {
-      headerEmoji: ":Hype:",
-      time: "Saturdays",
-      leader: "@jmetzger87",
-      notes: "",
-    },
+    WEEKEND: { headerEmoji: ":shield:", time: "Thursday & Sunday Evenings", leader: "@snick_", notes: "" },
+    SOLO: { headerEmoji: ":crossed_swords:", time: "Friday Evening", leader: "@vikinghammers", notes: "" },
+    EARLY: { headerEmoji: ":sunrise:", time: "Tuesday & Thursday", leader: "@johnnynobeard", notes: "" },
+    CRIT: { headerEmoji: ":fire:", time: "Friday & Sunday (Late Evening)", leader: "@frostynips", notes: "Melee DPS: Monk please" },
   },
 };
 
@@ -117,7 +80,6 @@ function extractEventIdFromMessage(msg) {
       for (const f of emb.fields) {
         eventId = extractEventIdFromText(f?.name);
         if (eventId) return eventId;
-
         eventId = extractEventIdFromText(f?.value);
         if (eventId) return eventId;
       }
@@ -140,7 +102,6 @@ function extractEventIdFromMessage(msg) {
   return null;
 }
 
-// Discord max limit per fetch is 100; you only need 50 but we keep it safe.
 async function fetchRecentMessages(textChannel, totalDesired) {
   const total = Math.max(0, Number(totalDesired) || 0);
   const all = [];
@@ -185,28 +146,102 @@ async function fetchRaidHelperEvent(eventId) {
   return await res.json();
 }
 
-function countRoles(eventJson) {
-  const signUps = Array.isArray(eventJson.signUps) ? eventJson.signUps : [];
+// -------------------- FIXED: Robust counting --------------------
 
-  const ignoreClass = new Set(["Late", "Bench", "Tentative", "Absence"]);
-  const primaries = signUps.filter((s) => {
-    const cn = String(s.className || "");
-    const st = String(s.status || "primary").toLowerCase();
-    return !ignoreClass.has(cn) && st === "primary";
-  });
+function normalize(str) {
+  return String(str || "").trim().toLowerCase();
+}
+
+function isIncludedStatus(statusRaw) {
+  // Raid-Helper varies by event/template.
+  // We INCLUDE if status is missing, or looks like a real signup.
+  // We EXCLUDE common non-primary statuses.
+  const s = normalize(statusRaw);
+  if (!s) return true;
+
+  const excluded = new Set([
+    "bench", "benched",
+    "late",
+    "tentative",
+    "absence", "absent",
+    "declined",
+    "cancelled", "canceled",
+  ]);
+
+  if (excluded.has(s)) return false;
+
+  // Common included statuses:
+  // primary, signed, confirmed, accepted, going, yes
+  return true;
+}
+
+function isIgnoredBucket(classNameRaw) {
+  const cn = normalize(classNameRaw);
+  const ignored = new Set(["late", "bench", "tentative", "absence"]);
+  return ignored.has(cn);
+}
+
+function countRoles(eventJson, teamNameForLogs = "") {
+  const signUps = Array.isArray(eventJson.signUps) ? eventJson.signUps : [];
 
   const counts = { tanks: 0, healers: 0, melee: 0, ranged: 0, mh: 0, rh: 0 };
 
-  for (const s of primaries) {
-    const role = String(s.roleName || "");
-    if (role === "Tanks") counts.tanks++;
-    else if (role === "Healers") {
+  // Debug: show what roleName values actually exist (helps if something still looks off)
+  const roleHistogram = new Map();
+
+  for (const s of signUps) {
+    if (isIgnoredBucket(s.className)) continue;
+    if (!isIncludedStatus(s.status)) continue;
+
+    const roleRaw = s.roleName ?? "";
+    const role = normalize(roleRaw);
+
+    roleHistogram.set(role, (roleHistogram.get(role) || 0) + 1);
+
+    // Tanks
+    if (role.includes("tank")) {
+      counts.tanks++;
+      continue;
+    }
+
+    // Healers
+    if (role.includes("heal")) {
       counts.healers++;
       const spec = String(s.specName || "");
       if (CONFIG.meleeHealerSpecs.has(spec)) counts.mh++;
       else counts.rh++;
-    } else if (role === "Melee") counts.melee++;
-    else if (role === "Ranged") counts.ranged++;
+      continue;
+    }
+
+    // Ranged DPS buckets (tons of variations)
+    if (role.includes("ranged") || role.includes("rdps") || role.includes("range dps") || role === "r") {
+      counts.ranged++;
+      continue;
+    }
+
+    // Melee DPS buckets (variations)
+    if (role.includes("melee") || role.includes("mdps") || role.includes("melee dps") || role === "m") {
+      counts.melee++;
+      continue;
+    }
+
+    // Generic DPS/Damage bucket (some templates just use "DPS" or "Damage")
+    if (role === "dps" || role.includes("damage") || role.includes("dd")) {
+      // If they don't split, count toward total DPS (default to ranged for display? better: split evenly)
+      // We'll just add to ranged so the total DPS isn't zero.
+      counts.ranged++;
+      continue;
+    }
+  }
+
+  if (teamNameForLogs) {
+    const topRoles = Array.from(roleHistogram.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([k, v]) => `${k || "(blank)"}=${v}`)
+      .join(", ");
+
+    console.log(`[${teamNameForLogs}] role buckets seen: ${topRoles}`);
   }
 
   return counts;
@@ -219,16 +254,10 @@ function needCount(have, target) {
 }
 
 function roleBadge(need) {
-  // ✅ if full, else number needed
   return need === 0 ? ":white_check_mark:" : String(need);
 }
 
 function dpsBadges(dpsNeedTotal) {
-  // Your style uses :heart: for "all welcome / no cap"
-  // If DPS is not full, show 1-2 style. We'll keep it simple:
-  // - if 1 => "1"
-  // - if 2 => "1-2"
-  // - if 3+ => "3+"
   if (dpsNeedTotal <= 0) return { ranged: ":heart:", melee: ":heart:" };
   if (dpsNeedTotal === 1) return { ranged: "1", melee: "1" };
   if (dpsNeedTotal === 2) return { ranged: "1-2", melee: "1-2" };
@@ -246,7 +275,6 @@ function renderRecruitmentPost(teamSummaries) {
   lines.push("");
   lines.push("");
 
-  // Build a lookup by team key/name to keep ordering and static info
   const byName = new Map(teamSummaries.map((s) => [s.teamName.toUpperCase(), s]));
 
   for (const team of CONFIG.teams) {
@@ -255,7 +283,6 @@ function renderRecruitmentPost(teamSummaries) {
 
     const summary = byName.get(team.name.toUpperCase());
 
-    // If no event found for that team, still print the block but show unknown
     if (!summary) {
       lines.push(`**${card.headerEmoji} ${team.name}**`);
       lines.push(`:alarm_clock: ${card.time}`);
@@ -291,7 +318,6 @@ function renderRecruitmentPost(teamSummaries) {
     lines.push(`- :dart: Ranged DPS:  ${dps.ranged}`);
     lines.push(`- :crossed_swords: Melee DPS:  ${dps.melee}`);
 
-    // Optional notes line (ex: Monk please)
     if (card.notes && card.notes.trim().length > 0) {
       lines.push(`  - _${card.notes}_`);
     }
@@ -358,8 +384,7 @@ function needLine(label, have, target) {
 async function ensureBotMessage(textChannel, existingMessageId, label) {
   if (existingMessageId && existingMessageId.trim().length > 0) {
     try {
-      const msg = await textChannel.messages.fetch(existingMessageId.trim());
-      return msg;
+      return await textChannel.messages.fetch(existingMessageId.trim());
     } catch {
       console.log(`${label}: Could not fetch message id. Creating a new one.`);
     }
@@ -390,7 +415,7 @@ async function buildTeamSummaries() {
       }
 
       const eventJson = await fetchRaidHelperEvent(eventId);
-      const counts = countRoles(eventJson);
+      const counts = countRoles(eventJson, team.name);
 
       teamSummaries.push({
         teamName: team.name,
@@ -414,21 +439,17 @@ async function buildTeamSummaries() {
 async function updateAllOutputs() {
   const summaries = await buildTeamSummaries();
 
-  // Dashboard
   const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
   if (!dashboardChannel || !dashboardChannel.isTextBased()) {
     throw new Error("Dashboard channel not found or not text-based.");
   }
-
   const dashMsg = await ensureBotMessage(dashboardChannel, CONFIG.dashboardMessageId, "DASHBOARD");
   await dashMsg.edit(renderDashboardAnsi(summaries));
 
-  // Recruitment thread
   const thread = await client.channels.fetch(CONFIG.recruitmentThreadId);
   if (!thread || !thread.isTextBased()) {
     throw new Error("Recruitment thread not found or not text-based. Check RECRUITMENT_THREAD_ID.");
   }
-
   const recMsg = await ensureBotMessage(thread, CONFIG.recruitmentMessageId, "RECRUITMENT");
   await recMsg.edit(renderRecruitmentPost(summaries));
 
