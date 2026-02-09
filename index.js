@@ -10,28 +10,29 @@ import {
 
 /**
  * UNITY RAID OVERSIGHT BOT
- * - Finds the newest Raid-Helper event link in each team signup channel
+ *
+ * - Finds newest Raid-Helper event link in each signup channel
  * - Fetches event JSON from https://raid-helper.dev/api/v2/events/<eventId>
  * - Counts Tanks / Healers / Melee / Ranged (and optional melee-vs-ranged healer split)
  * - Computes NEED vs perfect comp (2 tanks, 4 healers, rest DPS based on raidSize)
- * - Edits ONE dashboard message (so it never gets buried)
+ * - Creates its own dashboard message if DASHBOARD_MESSAGE_ID is not set
  *
- * Required Railway Variables:
+ * Railway Variables required:
  * BOT_TOKEN
  * GUILD_ID
  * DASHBOARD_CHANNEL_ID
- * DASHBOARD_MESSAGE_ID
+ *
+ * Optional:
+ * DASHBOARD_MESSAGE_ID  (must be a message authored by the BOT)
  */
 
 const CONFIG = {
   guildId: process.env.GUILD_ID,
   dashboardChannelId: process.env.DASHBOARD_CHANNEL_ID,
-  dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID,
+  dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID || "",
 
-  // how many recent messages to scan in each signup channel to find the newest raid-helper link
-  lookbackMessages: 75,
+  lookbackMessages: 100, // scan this many recent messages in signup channels
 
-  // Teams + signup channels (Discord channel IDs)
   teams: [
     { name: "SOLOMONO", signupChannelId: "1071192840408940626", raidSize: 20 },
     { name: "CRIT HAPPENS", signupChannelId: "1248666830810251354", raidSize: 20 },
@@ -39,11 +40,10 @@ const CONFIG = {
     { name: "WEEKEND WARRIORS", signupChannelId: "1338703521138081902", raidSize: 20 },
   ],
 
-  // Perfect comp
   targets: { tanks: 2, healers: 4 },
 
-  // Optional: split healers into "melee" vs "ranged" by spec
-  // Holy Paladin sometimes shows as "Holy1" in Raid-Helper JSON.
+  // Optional: split healers into melee vs ranged by spec name
+  // (Holy Paladin sometimes appears as "Holy1" in Raid-Helper JSON)
   meleeHealerSpecs: new Set(["Mistweaver", "Holy", "Holy1"]),
 };
 
@@ -51,12 +51,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+// ---- Helpers ----
+
 function extractEventIdFromMessage(msg) {
-  // 1) Link in plain message content
+  // 1) Content
   const m1 = msg.content?.match(/raid-helper\.dev\/event\/(\d+)/i);
   if (m1) return m1[1];
 
-  // 2) Link inside embeds (common)
+  // 2) Embeds
   for (const emb of msg.embeds ?? []) {
     const url = emb.url || "";
     const m2 = url.match(/raid-helper\.dev\/event\/(\d+)/i);
@@ -66,10 +68,7 @@ function extractEventIdFromMessage(msg) {
 }
 
 async function findLatestRaidHelperEventId(signupChannel) {
-  const messages = await signupChannel.messages.fetch({
-    limit: CONFIG.lookbackMessages,
-  });
-
+  const messages = await signupChannel.messages.fetch({ limit: CONFIG.lookbackMessages });
   for (const msg of messages.values()) {
     const eventId = extractEventIdFromMessage(msg);
     if (eventId) return eventId;
@@ -80,11 +79,8 @@ async function findLatestRaidHelperEventId(signupChannel) {
 async function fetchRaidHelperEvent(eventId) {
   const url = `https://raid-helper.dev/api/v2/events/${eventId}`;
   const res = await fetch(url);
-
   if (!res.ok) {
-    throw new Error(
-      `Raid-Helper fetch failed: ${res.status} ${await res.text()}`
-    );
+    throw new Error(`Raid-Helper fetch failed: ${res.status} ${await res.text()}`);
   }
   return await res.json();
 }
@@ -92,7 +88,6 @@ async function fetchRaidHelperEvent(eventId) {
 function countRoles(eventJson) {
   const signUps = Array.isArray(eventJson.signUps) ? eventJson.signUps : [];
 
-  // Ignore special buckets and anything not primary
   const ignoreClass = new Set(["Late", "Bench", "Tentative", "Absence"]);
   const primaries = signUps.filter((s) => {
     const cn = String(s.className || "");
@@ -100,14 +95,7 @@ function countRoles(eventJson) {
     return !ignoreClass.has(cn) && st === "primary";
   });
 
-  const counts = {
-    tanks: 0,
-    healers: 0,
-    melee: 0,
-    ranged: 0,
-    mh: 0, // melee healers
-    rh: 0, // ranged healers
-  };
+  const counts = { tanks: 0, healers: 0, melee: 0, ranged: 0, mh: 0, rh: 0 };
 
   for (const s of primaries) {
     const role = String(s.roleName || "");
@@ -133,15 +121,17 @@ function needLine(label, have, target) {
 
 function renderDashboard(teamSummaries) {
   const now = new Date();
-  const weekOf = now.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
+  const weekOf = now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
   const lines = [];
   lines.push(`UNITY RAID OVERSIGHT — Week of ${weekOf}`);
   lines.push("");
+
+  if (teamSummaries.length === 0) {
+    lines.push("No upcoming Raid-Helper events found in signup channels.");
+    lines.push("If this is unexpected, make sure each signup channel has a recent Raid-Helper signup post.");
+    return "```ansi\n" + lines.join("\n") + "\n```";
+  }
 
   for (const s of teamSummaries) {
     const when = new Date(s.startTime * 1000).toLocaleString("en-US", {
@@ -172,48 +162,68 @@ function renderDashboard(teamSummaries) {
   return "```ansi\n" + lines.join("\n") + "\n```";
 }
 
+async function ensureDashboardMessage(dashboardChannel) {
+  // If provided, we try to fetch it (must be authored by the bot).
+  if (CONFIG.dashboardMessageId && CONFIG.dashboardMessageId.trim().length > 0) {
+    try {
+      const msg = await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId.trim());
+      return msg;
+    } catch (err) {
+      console.log("DASHBOARD_MESSAGE_ID was set but could not be fetched. Creating a new dashboard message instead.");
+    }
+  }
+
+  // Otherwise create a new bot-authored dashboard message
+  const msg = await dashboardChannel.send("```ansi\nDashboard initializing...\n```");
+  console.log("Created dashboard message. Set DASHBOARD_MESSAGE_ID to:", msg.id);
+  return msg;
+}
+
 async function updateDashboard() {
   const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
   if (!dashboardChannel || !dashboardChannel.isTextBased()) {
     throw new Error("Dashboard channel not found or not text-based.");
   }
 
+  const dashboardMsg = await ensureDashboardMessage(dashboardChannel);
+
   const teamSummaries = [];
 
   for (const team of CONFIG.teams) {
-    const signupChannel = await client.channels.fetch(team.signupChannelId);
-    if (!signupChannel || !signupChannel.isTextBased()) {
-      console.log(`[${team.name}] Signup channel not found or not text-based.`);
-      continue;
+    try {
+      const signupChannel = await client.channels.fetch(team.signupChannelId);
+      if (!signupChannel || !signupChannel.isTextBased()) {
+        console.log(`[${team.name}] Signup channel not found or not text-based.`);
+        continue;
+      }
+
+      const eventId = await findLatestRaidHelperEventId(signupChannel);
+      if (!eventId) {
+        console.log(`[${team.name}] No raid-helper event link found in last ${CONFIG.lookbackMessages} messages.`);
+        continue;
+      }
+
+      const eventJson = await fetchRaidHelperEvent(eventId);
+      const counts = countRoles(eventJson);
+
+      teamSummaries.push({
+        teamName: team.name,
+        startTime: eventJson.startTime,
+        counts,
+        raidSize: team.raidSize ?? 20,
+      });
+
+      console.log(`[${team.name}] Event ${eventId} counted:`, counts);
+    } catch (err) {
+      // IMPORTANT: don't crash the whole update if one channel errors
+      console.log(`[${team.name}] Skipping due to error:`, err?.message || err);
     }
-
-    const eventId = await findLatestRaidHelperEventId(signupChannel);
-    if (!eventId) {
-      console.log(
-        `[${team.name}] No raid-helper event link found in last ${CONFIG.lookbackMessages} messages.`
-      );
-      continue;
-    }
-
-    const eventJson = await fetchRaidHelperEvent(eventId);
-    const counts = countRoles(eventJson);
-
-    teamSummaries.push({
-      teamName: team.name,
-      startTime: eventJson.startTime,
-      counts,
-      raidSize: team.raidSize ?? 20,
-    });
-
-    console.log(`[${team.name}] Event ${eventId} counted:`, counts);
   }
 
   teamSummaries.sort((a, b) => a.startTime - b.startTime);
 
   const content = renderDashboard(teamSummaries);
-
-  const msg = await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId);
-  await msg.edit(content);
+  await dashboardMsg.edit(content);
 
   console.log("Dashboard updated.");
 }
@@ -231,6 +241,8 @@ async function registerCommands() {
 
   console.log("Slash command registered: /refreshdashboard");
 }
+
+// ---- Bot lifecycle ----
 
 client.on("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
