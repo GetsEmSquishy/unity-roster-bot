@@ -8,25 +8,13 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 
-/**
- * UNITY RAID OVERSIGHT BOT (Improved link detection)
- *
- * Required Railway Variables:
- * BOT_TOKEN
- * GUILD_ID
- * DASHBOARD_CHANNEL_ID
- *
- * Optional:
- * DASHBOARD_MESSAGE_ID (must be authored by bot, otherwise bot will create one)
- */
-
 const CONFIG = {
   guildId: process.env.GUILD_ID,
   dashboardChannelId: process.env.DASHBOARD_CHANNEL_ID,
   dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID || "",
 
-  // Increase this if the signup channel is chatty
-  lookbackMessages: 300,
+  // Discord hard limit: max 100
+  lookbackMessages: 100,
 
   teams: [
     { name: "SOLOMONO", signupChannelId: "1071192840408940626", raidSize: 20 },
@@ -43,24 +31,16 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// -------------------- Robust event link extraction --------------------
-
 function extractEventIdFromText(text) {
   if (!text) return null;
-
-  // Matches:
-  // https://raid-helper.dev/event/1462883108356362291
-  // raid-helper.dev/event/1462883108356362291
   const m = String(text).match(/raid-helper\.dev\/event\/(\d{10,30})/i);
   return m ? m[1] : null;
 }
 
 function extractEventIdFromMessage(msg) {
-  // 1) Direct message content
   let eventId = extractEventIdFromText(msg.content);
   if (eventId) return eventId;
 
-  // 2) Embeds: url/title/description/fields/author/footer
   for (const emb of msg.embeds ?? []) {
     eventId = extractEventIdFromText(emb.url);
     if (eventId) return eventId;
@@ -88,10 +68,8 @@ function extractEventIdFromMessage(msg) {
     if (eventId) return eventId;
   }
 
-  // 3) Components (buttons) often contain the event URL
   for (const row of msg.components ?? []) {
     for (const c of row.components ?? []) {
-      // Link buttons have .url
       eventId = extractEventIdFromText(c.url);
       if (eventId) return eventId;
     }
@@ -99,8 +77,6 @@ function extractEventIdFromMessage(msg) {
 
   return null;
 }
-
-// -------------------- Raid-Helper API --------------------
 
 async function findLatestRaidHelperEventId(signupChannel) {
   const messages = await signupChannel.messages.fetch({
@@ -147,8 +123,6 @@ function countRoles(eventJson) {
 
   return counts;
 }
-
-// -------------------- Rendering --------------------
 
 function needLine(label, have, target) {
   const need = Math.max(0, target - have);
@@ -200,8 +174,6 @@ function renderDashboardAnsi(teamSummaries) {
   return "```ansi\n" + lines.join("\n") + "\n```";
 }
 
-// -------------------- Dashboard message management --------------------
-
 async function ensureDashboardMessage(dashboardChannel) {
   if (CONFIG.dashboardMessageId && CONFIG.dashboardMessageId.trim().length > 0) {
     try {
@@ -216,8 +188,6 @@ async function ensureDashboardMessage(dashboardChannel) {
   console.log("Created dashboard message. Set DASHBOARD_MESSAGE_ID to:", msg.id);
   return msg;
 }
-
-// -------------------- Main update --------------------
 
 async function updateDashboard() {
   const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
@@ -266,8 +236,6 @@ async function updateDashboard() {
   console.log("Dashboard updated.");
 }
 
-// -------------------- Slash command --------------------
-
 async function registerCommands() {
   const cmd = new SlashCommandBuilder()
     .setName("refreshdashboard")
@@ -282,11 +250,8 @@ async function registerCommands() {
   console.log("Slash command registered: /refreshdashboard");
 }
 
-// -------------------- Lifecycle --------------------
-
 client.on("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-
   await registerCommands();
 
   await updateDashboard();
