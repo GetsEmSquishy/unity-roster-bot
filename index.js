@@ -9,21 +9,15 @@ import {
 } from "discord.js";
 
 /**
- * UNITY RAID OVERSIGHT BOT
+ * UNITY RAID OVERSIGHT BOT (Improved link detection)
  *
- * - Finds newest Raid-Helper event link in each signup channel
- * - Fetches event JSON from https://raid-helper.dev/api/v2/events/<eventId>
- * - Counts Tanks / Healers / Melee / Ranged (and optional melee-vs-ranged healer split)
- * - Computes NEED vs perfect comp (2 tanks, 4 healers, rest DPS based on raidSize)
- * - Creates its own dashboard message if DASHBOARD_MESSAGE_ID is not set
- *
- * Railway Variables required:
+ * Required Railway Variables:
  * BOT_TOKEN
  * GUILD_ID
  * DASHBOARD_CHANNEL_ID
  *
  * Optional:
- * DASHBOARD_MESSAGE_ID  (must be a message authored by the BOT)
+ * DASHBOARD_MESSAGE_ID (must be authored by bot, otherwise bot will create one)
  */
 
 const CONFIG = {
@@ -31,7 +25,8 @@ const CONFIG = {
   dashboardChannelId: process.env.DASHBOARD_CHANNEL_ID,
   dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID || "",
 
-  lookbackMessages: 100, // scan this many recent messages in signup channels
+  // Increase this if the signup channel is chatty
+  lookbackMessages: 300,
 
   teams: [
     { name: "SOLOMONO", signupChannelId: "1071192840408940626", raidSize: 20 },
@@ -41,9 +36,6 @@ const CONFIG = {
   ],
 
   targets: { tanks: 2, healers: 4 },
-
-  // Optional: split healers into melee vs ranged by spec name
-  // (Holy Paladin sometimes appears as "Holy1" in Raid-Helper JSON)
   meleeHealerSpecs: new Set(["Mistweaver", "Holy", "Holy1"]),
 };
 
@@ -51,24 +43,70 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// ---- Helpers ----
+// -------------------- Robust event link extraction --------------------
+
+function extractEventIdFromText(text) {
+  if (!text) return null;
+
+  // Matches:
+  // https://raid-helper.dev/event/1462883108356362291
+  // raid-helper.dev/event/1462883108356362291
+  const m = String(text).match(/raid-helper\.dev\/event\/(\d{10,30})/i);
+  return m ? m[1] : null;
+}
 
 function extractEventIdFromMessage(msg) {
-  // 1) Content
-  const m1 = msg.content?.match(/raid-helper\.dev\/event\/(\d+)/i);
-  if (m1) return m1[1];
+  // 1) Direct message content
+  let eventId = extractEventIdFromText(msg.content);
+  if (eventId) return eventId;
 
-  // 2) Embeds
+  // 2) Embeds: url/title/description/fields/author/footer
   for (const emb of msg.embeds ?? []) {
-    const url = emb.url || "";
-    const m2 = url.match(/raid-helper\.dev\/event\/(\d+)/i);
-    if (m2) return m2[1];
+    eventId = extractEventIdFromText(emb.url);
+    if (eventId) return eventId;
+
+    eventId = extractEventIdFromText(emb.title);
+    if (eventId) return eventId;
+
+    eventId = extractEventIdFromText(emb.description);
+    if (eventId) return eventId;
+
+    if (Array.isArray(emb.fields)) {
+      for (const f of emb.fields) {
+        eventId = extractEventIdFromText(f?.name);
+        if (eventId) return eventId;
+
+        eventId = extractEventIdFromText(f?.value);
+        if (eventId) return eventId;
+      }
+    }
+
+    eventId = extractEventIdFromText(emb.author?.url);
+    if (eventId) return eventId;
+
+    eventId = extractEventIdFromText(emb.footer?.text);
+    if (eventId) return eventId;
   }
+
+  // 3) Components (buttons) often contain the event URL
+  for (const row of msg.components ?? []) {
+    for (const c of row.components ?? []) {
+      // Link buttons have .url
+      eventId = extractEventIdFromText(c.url);
+      if (eventId) return eventId;
+    }
+  }
+
   return null;
 }
 
+// -------------------- Raid-Helper API --------------------
+
 async function findLatestRaidHelperEventId(signupChannel) {
-  const messages = await signupChannel.messages.fetch({ limit: CONFIG.lookbackMessages });
+  const messages = await signupChannel.messages.fetch({
+    limit: CONFIG.lookbackMessages,
+  });
+
   for (const msg of messages.values()) {
     const eventId = extractEventIdFromMessage(msg);
     if (eventId) return eventId;
@@ -79,9 +117,7 @@ async function findLatestRaidHelperEventId(signupChannel) {
 async function fetchRaidHelperEvent(eventId) {
   const url = `https://raid-helper.dev/api/v2/events/${eventId}`;
   const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Raid-Helper fetch failed: ${res.status} ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(`Raid-Helper fetch failed: ${res.status} ${await res.text()}`);
   return await res.json();
 }
 
@@ -112,6 +148,8 @@ function countRoles(eventJson) {
   return counts;
 }
 
+// -------------------- Rendering --------------------
+
 function needLine(label, have, target) {
   const need = Math.max(0, target - have);
   return need === 0
@@ -119,7 +157,7 @@ function needLine(label, have, target) {
     : `${label}: NEED ${need} (${have}/${target})`;
 }
 
-function renderDashboard(teamSummaries) {
+function renderDashboardAnsi(teamSummaries) {
   const now = new Date();
   const weekOf = now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
@@ -162,22 +200,24 @@ function renderDashboard(teamSummaries) {
   return "```ansi\n" + lines.join("\n") + "\n```";
 }
 
+// -------------------- Dashboard message management --------------------
+
 async function ensureDashboardMessage(dashboardChannel) {
-  // If provided, we try to fetch it (must be authored by the bot).
   if (CONFIG.dashboardMessageId && CONFIG.dashboardMessageId.trim().length > 0) {
     try {
       const msg = await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId.trim());
       return msg;
-    } catch (err) {
-      console.log("DASHBOARD_MESSAGE_ID was set but could not be fetched. Creating a new dashboard message instead.");
+    } catch {
+      console.log("DASHBOARD_MESSAGE_ID set but not fetchable. Creating a new dashboard message.");
     }
   }
 
-  // Otherwise create a new bot-authored dashboard message
   const msg = await dashboardChannel.send("```ansi\nDashboard initializing...\n```");
   console.log("Created dashboard message. Set DASHBOARD_MESSAGE_ID to:", msg.id);
   return msg;
 }
+
+// -------------------- Main update --------------------
 
 async function updateDashboard() {
   const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
@@ -186,7 +226,6 @@ async function updateDashboard() {
   }
 
   const dashboardMsg = await ensureDashboardMessage(dashboardChannel);
-
   const teamSummaries = [];
 
   for (const team of CONFIG.teams) {
@@ -199,7 +238,7 @@ async function updateDashboard() {
 
       const eventId = await findLatestRaidHelperEventId(signupChannel);
       if (!eventId) {
-        console.log(`[${team.name}] No raid-helper event link found in last ${CONFIG.lookbackMessages} messages.`);
+        console.log(`[${team.name}] No event link found in last ${CONFIG.lookbackMessages} messages.`);
         continue;
       }
 
@@ -213,20 +252,21 @@ async function updateDashboard() {
         raidSize: team.raidSize ?? 20,
       });
 
-      console.log(`[${team.name}] Event ${eventId} counted:`, counts);
+      console.log(`[${team.name}] Found event ${eventId}. Counts:`, counts);
     } catch (err) {
-      // IMPORTANT: don't crash the whole update if one channel errors
-      console.log(`[${team.name}] Skipping due to error:`, err?.message || err);
+      console.log(`[${team.name}] Skipped due to error:`, err?.message || err);
     }
   }
 
   teamSummaries.sort((a, b) => a.startTime - b.startTime);
 
-  const content = renderDashboard(teamSummaries);
+  const content = renderDashboardAnsi(teamSummaries);
   await dashboardMsg.edit(content);
 
   console.log("Dashboard updated.");
 }
+
+// -------------------- Slash command --------------------
 
 async function registerCommands() {
   const cmd = new SlashCommandBuilder()
@@ -242,14 +282,13 @@ async function registerCommands() {
   console.log("Slash command registered: /refreshdashboard");
 }
 
-// ---- Bot lifecycle ----
+// -------------------- Lifecycle --------------------
 
 client.on("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   await registerCommands();
 
-  // Update on boot + every 2 hours
   await updateDashboard();
   setInterval(updateDashboard, 2 * 60 * 60 * 1000);
 });
