@@ -8,13 +8,25 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 
+/**
+ * UNITY RAID OVERSIGHT BOT (Paged message fetch)
+ *
+ * Required Railway Variables:
+ * BOT_TOKEN
+ * GUILD_ID
+ * DASHBOARD_CHANNEL_ID
+ *
+ * Optional:
+ * DASHBOARD_MESSAGE_ID (must be authored by bot; if missing, bot creates one)
+ */
+
 const CONFIG = {
   guildId: process.env.GUILD_ID,
   dashboardChannelId: process.env.DASHBOARD_CHANNEL_ID,
   dashboardMessageId: process.env.DASHBOARD_MESSAGE_ID || "",
 
-  // Discord hard limit: max 100
-  lookbackMessages: 100,
+  // Total messages to scan in each signup channel (we'll fetch in pages of 100)
+  LOOKBACK_TOTAL: 300,
 
   teams: [
     { name: "SOLOMONO", signupChannelId: "1071192840408940626", raidSize: 20 },
@@ -31,6 +43,8 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+// -------------------- Robust event link extraction --------------------
+
 function extractEventIdFromText(text) {
   if (!text) return null;
   const m = String(text).match(/raid-helper\.dev\/event\/(\d{10,30})/i);
@@ -38,9 +52,11 @@ function extractEventIdFromText(text) {
 }
 
 function extractEventIdFromMessage(msg) {
+  // 1) Direct content
   let eventId = extractEventIdFromText(msg.content);
   if (eventId) return eventId;
 
+  // 2) Embeds: url/title/description/fields/author/footer
   for (const emb of msg.embeds ?? []) {
     eventId = extractEventIdFromText(emb.url);
     if (eventId) return eventId;
@@ -68,6 +84,7 @@ function extractEventIdFromMessage(msg) {
     if (eventId) return eventId;
   }
 
+  // 3) Buttons (components) may contain link URLs
   for (const row of msg.components ?? []) {
     for (const c of row.components ?? []) {
       eventId = extractEventIdFromText(c.url);
@@ -78,17 +95,50 @@ function extractEventIdFromMessage(msg) {
   return null;
 }
 
-async function findLatestRaidHelperEventId(signupChannel) {
-  const messages = await signupChannel.messages.fetch({
-    limit: CONFIG.lookbackMessages,
-  });
+// -------------------- Discord-safe paged message fetch --------------------
+// Discord limit per request is max 100. We'll page backwards using "before".
+async function fetchRecentMessagesPaged(textChannel, totalDesired) {
+  const total = Math.max(0, Number(totalDesired) || 0);
+  const all = [];
 
-  for (const msg of messages.values()) {
+  let beforeId = undefined;
+
+  while (all.length < total) {
+    const remaining = total - all.length;
+    const limit = Math.min(100, remaining);
+
+    const batch = await textChannel.messages.fetch({
+      limit,
+      ...(beforeId ? { before: beforeId } : {}),
+    });
+
+    if (batch.size === 0) break;
+
+    // Add to array in fetch order (newest->older)
+    const batchArr = Array.from(batch.values());
+    all.push(...batchArr);
+
+    // Set beforeId to the oldest message in this batch for next page
+    beforeId = batchArr[batchArr.length - 1].id;
+
+    // Safety: if Discord returns fewer than requested, we're near the end
+    if (batch.size < limit) break;
+  }
+
+  return all;
+}
+
+async function findLatestRaidHelperEventId(signupChannel) {
+  const messages = await fetchRecentMessagesPaged(signupChannel, CONFIG.LOOKBACK_TOTAL);
+
+  for (const msg of messages) {
     const eventId = extractEventIdFromMessage(msg);
     if (eventId) return eventId;
   }
   return null;
 }
+
+// -------------------- Raid-Helper API --------------------
 
 async function fetchRaidHelperEvent(eventId) {
   const url = `https://raid-helper.dev/api/v2/events/${eventId}`;
@@ -124,6 +174,8 @@ function countRoles(eventJson) {
   return counts;
 }
 
+// -------------------- Rendering --------------------
+
 function needLine(label, have, target) {
   const need = Math.max(0, target - have);
   return need === 0
@@ -141,7 +193,7 @@ function renderDashboardAnsi(teamSummaries) {
 
   if (teamSummaries.length === 0) {
     lines.push("No upcoming Raid-Helper events found in signup channels.");
-    lines.push("If this is unexpected, make sure each signup channel has a recent Raid-Helper signup post.");
+    lines.push("If unexpected: verify signup posts exist, or pin them (we can add pinned-first scanning next).");
     return "```ansi\n" + lines.join("\n") + "\n```";
   }
 
@@ -174,11 +226,12 @@ function renderDashboardAnsi(teamSummaries) {
   return "```ansi\n" + lines.join("\n") + "\n```";
 }
 
+// -------------------- Dashboard message management --------------------
+
 async function ensureDashboardMessage(dashboardChannel) {
   if (CONFIG.dashboardMessageId && CONFIG.dashboardMessageId.trim().length > 0) {
     try {
-      const msg = await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId.trim());
-      return msg;
+      return await dashboardChannel.messages.fetch(CONFIG.dashboardMessageId.trim());
     } catch {
       console.log("DASHBOARD_MESSAGE_ID set but not fetchable. Creating a new dashboard message.");
     }
@@ -188,6 +241,8 @@ async function ensureDashboardMessage(dashboardChannel) {
   console.log("Created dashboard message. Set DASHBOARD_MESSAGE_ID to:", msg.id);
   return msg;
 }
+
+// -------------------- Main update --------------------
 
 async function updateDashboard() {
   const dashboardChannel = await client.channels.fetch(CONFIG.dashboardChannelId);
@@ -208,7 +263,7 @@ async function updateDashboard() {
 
       const eventId = await findLatestRaidHelperEventId(signupChannel);
       if (!eventId) {
-        console.log(`[${team.name}] No event link found in last ${CONFIG.lookbackMessages} messages.`);
+        console.log(`[${team.name}] No event link found in last ${CONFIG.LOOKBACK_TOTAL} messages.`);
         continue;
       }
 
@@ -230,11 +285,11 @@ async function updateDashboard() {
 
   teamSummaries.sort((a, b) => a.startTime - b.startTime);
 
-  const content = renderDashboardAnsi(teamSummaries);
-  await dashboardMsg.edit(content);
-
+  await dashboardMsg.edit(renderDashboardAnsi(teamSummaries));
   console.log("Dashboard updated.");
 }
+
+// -------------------- Slash command --------------------
 
 async function registerCommands() {
   const cmd = new SlashCommandBuilder()
@@ -250,8 +305,11 @@ async function registerCommands() {
   console.log("Slash command registered: /refreshdashboard");
 }
 
+// -------------------- Lifecycle --------------------
+
 client.on("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
   await registerCommands();
 
   await updateDashboard();
