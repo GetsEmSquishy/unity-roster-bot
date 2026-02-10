@@ -11,14 +11,14 @@ import {
 /**
  * UNITY RAID OVERSIGHT BOT
  *
- * - Reads each team's latest Raid-Helper event
- * - Works with BOTH Raid-Helper templates:
- *    1) roleName-based (Melee/Ranged/Tanks/Healers in roleName)
- *    2) className-based DPS buckets (Melee/Ranged stored in className, roleName may be blank)
- *
  * Outputs:
- * 1) Oversight Dashboard (channel + bot message)
- * 2) RAID RECRUITMENT thread (thread + bot message) using emoji formatting
+ * 1) Oversight Dashboard (ansi)
+ * 2) RAID RECRUITMENT thread (emoji formatted)
+ *
+ * Recruitment rules:
+ * - NO hearts
+ * - DPS need shown as exact numbers
+ * - DPS need split 50/50 (ranged gets the extra if odd)
  *
  * Required Railway Variables:
  * BOT_TOKEN
@@ -40,16 +40,12 @@ const CONFIG = {
   recruitmentThreadId: process.env.RECRUITMENT_THREAD_ID,
   recruitmentMessageId: process.env.RECRUITMENT_MESSAGE_ID || "",
 
-  // Your signup channels are locked down, so we only need to scan a small number
   LOOKBACK_TOTAL: 50,
 
-  // Perfect comp
   targets: { tanks: 2, healers: 4 },
 
-  // Optional healer split by spec
   meleeHealerSpecs: new Set(["Mistweaver", "Holy", "Holy1"]),
 
-  // Teams (signup channels + raid size)
   teams: [
     { key: "WEEKEND", name: "WEEKEND WARRIORS", signupChannelId: "1338703521138081902", raidSize: 20 },
     { key: "SOLO", name: "SOLONOMO", signupChannelId: "1071192840408940626", raidSize: 20 },
@@ -57,32 +53,11 @@ const CONFIG = {
     { key: "CRIT", name: "CRIT HAPPENS", signupChannelId: "1248666830810251354", raidSize: 20 },
   ],
 
-  // Static recruitment card info (your preferred presentation)
   recruitmentCards: {
-    WEEKEND: {
-      headerEmoji: ":shield:",
-      time: "Thursday & Sunday Evenings",
-      leader: "@snick_",
-      notes: "",
-    },
-    SOLO: {
-      headerEmoji: ":crossed_swords:",
-      time: "Friday Evening",
-      leader: "@vikinghammers",
-      notes: "",
-    },
-    EARLY: {
-      headerEmoji: ":sunrise:",
-      time: "Tuesday & Thursday",
-      leader: "@johnnynobeard",
-      notes: "",
-    },
-    CRIT: {
-      headerEmoji: ":fire:",
-      time: "Friday & Sunday (Late Evening)",
-      leader: "@frostynips",
-      notes: "Melee DPS: Monk please",
-    },
+    WEEKEND: { headerEmoji: ":shield:", time: "Thursday & Sunday Evenings", leader: "@snick_" },
+    SOLO: { headerEmoji: ":crossed_swords:", time: "Friday Evening", leader: "@vikinghammers" },
+    EARLY: { headerEmoji: ":sunrise:", time: "Tuesday & Thursday", leader: "@johnnynobeard" },
+    CRIT: { headerEmoji: ":fire:", time: "Friday & Sunday (Late Evening)", leader: "@frostynips" },
   },
 };
 
@@ -183,7 +158,7 @@ async function fetchRaidHelperEvent(eventId) {
   return await res.json();
 }
 
-// -------------------- Counting (FIXED for both templates) --------------------
+// -------------------- Counting (works for both templates) --------------------
 
 function normalize(str) {
   return String(str || "").trim().toLowerCase();
@@ -191,37 +166,29 @@ function normalize(str) {
 
 function countRoles(eventJson, teamNameForLogs = "") {
   const signUps = Array.isArray(eventJson.signUps) ? eventJson.signUps : [];
-
   const ignoreClass = new Set(["late", "bench", "tentative", "absence"]);
 
-  // We keep totals + optional healer split
   const counts = { tanks: 0, healers: 0, melee: 0, ranged: 0, mh: 0, rh: 0 };
 
-  // Debug: show which "buckets" are being seen
   const bucketHistogram = new Map();
 
   for (const s of signUps) {
     const className = normalize(s.className);
     if (ignoreClass.has(className)) continue;
 
-    // Many events use status:"primary". Some omit it.
-    // We'll only exclude clearly non-primary values.
     const status = normalize(s.status);
     if (status && status !== "primary") continue;
 
-    // ✅ KEY FIX: Some templates store DPS bucket in className (Melee/Ranged)
-    // roleName may be blank. So use roleName OR className.
+    // KEY: some templates store DPS bucket in className
     const bucket = normalize(s.roleName || s.className);
 
     bucketHistogram.set(bucket || "(blank)", (bucketHistogram.get(bucket || "(blank)") || 0) + 1);
 
-    // Tanks
     if (bucket.includes("tank")) {
       counts.tanks++;
       continue;
     }
 
-    // Healers
     if (bucket.includes("heal")) {
       counts.healers++;
       const spec = String(s.specName || "");
@@ -230,7 +197,6 @@ function countRoles(eventJson, teamNameForLogs = "") {
       continue;
     }
 
-    // DPS split
     if (bucket.includes("melee")) {
       counts.melee++;
       continue;
@@ -241,9 +207,7 @@ function countRoles(eventJson, teamNameForLogs = "") {
       continue;
     }
 
-    // Catch-all for templates that just use "DPS" or "Damage"
     if (bucket === "dps" || bucket.includes("damage")) {
-      // Count it as ranged so total DPS isn't lost (optional choice)
       counts.ranged++;
       continue;
     }
@@ -278,12 +242,11 @@ function roleBadge(need) {
   return need === 0 ? ":white_check_mark:" : String(need);
 }
 
-// Your style uses :heart: for “all welcome / no cap”
-function dpsBadges(dpsNeedTotal) {
-  if (dpsNeedTotal <= 0) return { ranged: ":heart:", melee: ":heart:" };
-  if (dpsNeedTotal === 1) return { ranged: "1", melee: "1" };
-  if (dpsNeedTotal === 2) return { ranged: "1-2", melee: "1-2" };
-  return { ranged: "3+", melee: "3+" };
+// Split exact DPS need 50/50. Ranged gets the extra if odd.
+function splitDpsNeed50_50(dpsNeedTotal) {
+  const rangedNeed = Math.ceil(dpsNeedTotal / 2);
+  const meleeNeed = Math.floor(dpsNeedTotal / 2);
+  return { rangedNeed, meleeNeed };
 }
 
 function renderRecruitmentPost(teamSummaries) {
@@ -292,8 +255,6 @@ function renderRecruitmentPost(teamSummaries) {
   lines.push(":clipboard: **Recruitment Key**  ");
   lines.push("- The number shown next to each role = how many positions are needed.");
   lines.push("- :white_check_mark: = All positions for that role are filled.  ");
-  lines.push("- 1 (or other number) = That many spots are open.  ");
-  lines.push("- :heart: = All are welcome for that role (no cap).");
   lines.push("");
   lines.push("");
 
@@ -320,9 +281,10 @@ function renderRecruitmentPost(teamSummaries) {
     }
 
     const raidSize = team.raidSize ?? 20;
+
     const tanksTarget = CONFIG.targets.tanks;
     const healsTarget = CONFIG.targets.healers;
-    const dpsTarget = Math.max(0, raidSize - (tanksTarget + healsTarget));
+    const dpsTarget = Math.max(0, raidSize - (tanksTarget + healsTarget)); // 14 for 20-man
 
     const tankNeed = needCount(summary.counts.tanks, tanksTarget);
     const healNeed = needCount(summary.counts.healers, healsTarget);
@@ -330,19 +292,15 @@ function renderRecruitmentPost(teamSummaries) {
     const dpsHave = summary.counts.melee + summary.counts.ranged;
     const dpsNeed = needCount(dpsHave, dpsTarget);
 
-    const dps = dpsBadges(dpsNeed);
+    const { rangedNeed, meleeNeed } = splitDpsNeed50_50(dpsNeed);
 
     lines.push(`**${card.headerEmoji} ${team.name}**  `);
     lines.push(`:alarm_clock: ${card.time}  `);
     lines.push(`Raid Leader: ${card.leader}  `);
     lines.push(`- :shield: Tank:  ${roleBadge(tankNeed)}`);
     lines.push(`- :sparkles: Healer:  ${roleBadge(healNeed)}`);
-    lines.push(`- :dart: Ranged DPS:  ${dps.ranged}`);
-    lines.push(`- :crossed_swords: Melee DPS:  ${dps.melee}`);
-
-    if (card.notes && card.notes.trim().length > 0) {
-      lines.push(`  - _${card.notes}_`);
-    }
+    lines.push(`- :dart: Ranged DPS:  ${rangedNeed === 0 ? ":white_check_mark:" : String(rangedNeed)}`);
+    lines.push(`- :crossed_swords: Melee DPS:  ${meleeNeed === 0 ? ":white_check_mark:" : String(meleeNeed)}`);
 
     lines.push("");
     lines.push("---");
